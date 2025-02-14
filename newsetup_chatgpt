@@ -1,1 +1,203 @@
+#!/bin/bash
 
+LOG_FILE="/var/log/ocserv_setup.log"
+
+# Function to log messages
+log_message() {
+    local message=$1
+    echo -e "\e[1m\e[32m✔ $message\e[0m"
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $message" >> "$LOG_FILE"
+}
+
+# Function to handle errors
+error_exit() {
+    echo -e "\e[1m\e[31m✘ ERROR: $1\e[0m"
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - ERROR: $1" >> "$LOG_FILE"
+    exit 1
+}
+
+# Function to handle apt-get lock errors
+handle_lock() {
+    local lock_file="/var/lib/dpkg/lock-frontend"
+    local process_id
+
+    # Check if the lock file exists
+    if [[ -f "$lock_file" ]]; then
+        # Get the process holding the lock
+        process_id=$(ps aux | grep 'apt' | grep -v 'grep' | awk '{print $2}')
+        
+        if [[ -n "$process_id" ]]; then
+            echo "Found process holding lock: $process_id. Attempting to stop it..."
+            kill -9 "$process_id"
+            echo "Process killed. Retrying installation."
+        fi
+    fi
+    
+    # Clean up and fix dpkg
+    sudo rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock
+    sudo dpkg --configure -a
+}
+
+# Parse arguments
+parse_arguments() {
+    MONITOR_TOKEN=""
+    MONITOR_PORT=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --monitor_token)
+                MONITOR_TOKEN="$2"
+                shift 2
+                ;;
+            --m_port)
+                MONITOR_PORT="$2"
+                shift 2
+                ;;
+            *)
+                error_exit "Unknown parameter: $1"
+                ;;
+        esac
+    done
+
+    if [[ -z "$MONITOR_TOKEN" || -z "$MONITOR_PORT" ]]; then
+        error_exit "Missing required parameters. Usage: $0 --monitor_token <token> --m_port <port>"
+    fi
+}
+
+# Check root privileges
+check_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        error_exit "This script must be run as root or with sudo privileges."
+    fi
+}
+
+# Install necessary packages
+install_packages() {
+    log_message "Installing required packages..."
+    handle_lock # Call the lock handling function before installation
+    apt-get update -y && apt-get install -y ufw curl jq iptables freeradius freeradius-mysql ocserv openssl || error_exit "Failed to install packages."
+    log_message "Packages installed successfully."
+}
+
+# Setup directories
+setup_directories() {
+    TEMP_DIR="/temp"
+    mkdir -p "$TEMP_DIR"
+    chmod 777 "$TEMP_DIR"
+    log_message "Temporary directories set up."
+}
+
+# Auth script
+setup_auth_script() {
+    cat <<EOL > "$TEMP_DIR/auth.sh"
+#!/bin/bash
+USERNAME=\$1
+PASSWORD=\$2
+API_URL="https://etelvpn.com/api/apiauth.php"
+
+response=\$(curl -s -X POST -d "username=\$USERNAME&password=\$PASSWORD" "\$API_URL")
+
+if [ "\$response" -eq "1" ]; then
+    echo "REJECT"
+else
+    echo "ACCEPT"
+fi
+EOL
+    chmod +x "$TEMP_DIR/auth.sh"
+    log_message "Auth script configured."
+}
+
+# Disconnect script
+setup_disconnect_script() {
+    cat <<EOL > "$TEMP_DIR/disconnect.sh"
+#!/bin/bash
+USERNAME=\$1
+PASS=\$2
+if [ "\$PASS" = "Stop" ]; then
+    data=\$(curl -sb -X POST -F "username=\$USERNAME" -F "password=\$PASS" "disconnect_apilink")
+    /usr/bin/occtl disconnect user \$USERNAME
+    echo \$data
+fi
+EOL
+    chmod +x "$TEMP_DIR/disconnect.sh"
+    log_message "Disconnect script configured."
+}
+
+# Configure UFW rules
+setup_ufw_rules() {
+    cat <<EOL > /etc/ufw/before.rules
+*filter
+:ufw-before-input - [0:0]
+:ufw-before-output - [0:0]
+:ufw-before-forward - [0:0]
+:ufw-not-local - [0:0]
+-A ufw-before-input -i lo -j ACCEPT
+-A ufw-before-output -o lo -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-output -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate INVALID -j DROP
+-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT
+COMMIT
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -o eth0 -j MASQUERADE
+COMMIT
+EOL
+    chmod 644 /etc/ufw/before.rules
+    log_message "UFW rules configured."
+}
+
+# Generate self-signed certificate
+generate_certificate() {
+    CERT_DIR="/etc/ssl/certs"
+    KEY_DIR="/etc/ssl/private"
+    CERT_FILE="$CERT_DIR/ocserv-cert.pem"
+    KEY_FILE="$KEY_DIR/ocserv-key.pem"
+
+    if [[ ! -f $CERT_FILE || ! -f $KEY_FILE ]]; then
+        openssl req -newkey rsa:2048 -nodes -keyout $KEY_FILE -x509 -days 365 -out $CERT_FILE \
+            -subj "/C=US/ST=State/L=City/O=Organization/OU=Unit/CN=example.com" &>/dev/null || error_exit "Failed to generate certificate."
+        log_message "Certificate generated."
+    else
+        log_message "Certificate already exists. Skipping generation."
+    fi
+}
+
+# Configure ocserv
+setup_ocserv_config() {
+    cat <<EOL > /etc/ocserv/ocserv.conf
+auth = "radius[config=/etc/radcli/radiusclient.conf,groupconfig=true]"
+tcp-port = 443
+udp-port = 443
+run-as-user = nobody
+run-as-group = daemon
+server-cert = /etc/ssl/certs/ocserv-cert.pem
+server-key = /etc/ssl/private/ocserv-key.pem
+ca-cert = /etc/ssl/certs/ocserv-cert.pem
+socket-file = /run/ocserv-socket
+isolate-workers = true
+max-clients = 100
+max-same-clients = 2
+keepalive = 32400
+dpd = 90
+EOL
+    chmod 644 /etc/ocserv/ocserv.conf
+    log_message "Ocserv configuration set."
+}
+
+# Main function
+main() {
+    check_root
+    parse_arguments "$@"
+    install_packages
+    setup_directories
+    setup_auth_script
+    setup_disconnect_script
+    setup_ufw_rules
+    generate_certificate
+    setup_ocserv_config
+
+    log_message "All setup steps completed successfully!"
+}
+
+main "$@"
